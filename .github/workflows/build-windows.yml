@@ -1,0 +1,186 @@
+name: Build Windows
+
+# TransGram Desktop: x64 Release build.
+#
+# Runs only when started by hand (Actions -> Build Windows -> Run workflow)
+# or when a version tag like v7.3.2 is pushed. A tag build also publishes
+# a GitHub Release with the zipped TransGram.exe + modules folder.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   TG_API_ID    your api_id from https://my.telegram.org
+#   TG_API_HASH  your api_hash from https://my.telegram.org
+#
+# The first run has to build Qt and the other libraries, which can exceed
+# the 6 hour limit of GitHub-hosted runners. Start it once with
+# "libraries_only" checked: that fills the cache, and later runs restore it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      libraries_only:
+        description: "Only build and cache the third-party libraries"
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    env:
+      PREPARE_PATH: "Telegram/build/prepare/prepare.py"
+      LIBRARIES_ONLY: ${{ inputs.libraries_only && 'true' || 'false' }}
+
+    defaults:
+      run:
+        shell: cmd
+
+    steps:
+      - name: Prepare directories.
+        run: |
+          mkdir %userprofile%\TBuild\Libraries
+          mklink /d %GITHUB_WORKSPACE%\TBuild %userprofile%\TBuild
+          echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
+          echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries\win64>>%GITHUB_ENV%
+
+      - name: Get repository name.
+        shell: bash
+        run: echo "REPO_NAME=${GITHUB_REPOSITORY##*/}" >> $GITHUB_ENV
+
+      - name: Clone.
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          path: ${{ env.TBUILD }}\${{ env.REPO_NAME }}
+
+      - name: Check API credentials.
+        if: env.LIBRARIES_ONLY == 'false'
+        shell: bash
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        run: |
+          if [ -z "$TG_API_ID" ] || [ -z "$TG_API_HASH" ]; then
+            echo "::error::Set the TG_API_ID and TG_API_HASH repository secrets first."
+            exit 1
+          fi
+
+      - name: First set up.
+        shell: bash
+        run: |
+          DOCPATH=$TBUILD/$REPO_NAME/docs/building-win.md
+          SDK="$(grep "SDK version" $DOCPATH | sed -r 's/.*\*\*(.*)\*\* SDK version.*/\1/')"
+          echo "SDK=$SDK" >> $GITHUB_ENV
+
+          echo "$(sha256sum $TBUILD/$REPO_NAME/$PREPARE_PATH | awk '{ print $1 }')" >> CACHE_KEY.txt
+          echo "$SDK" >> CACHE_KEY.txt
+          echo "CACHE_KEY=$(sha256sum CACHE_KEY.txt | awk '{ print $1 }')" >> $GITHUB_ENV
+
+          echo "Configure git for the cherry-picks done by prepare.py."
+          git config --global user.email "ci@transgram.invalid"
+          git config --global user.name "TransGram CI"
+
+      - name: Native Tools Command Prompt.
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          sdk: ${{ env.SDK }}
+          toolset: '14.44'
+
+      - name: NuGet sources.
+        run: |
+          nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
+          nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
+
+      - name: ThirdParty cache.
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: ${{ runner.OS }}-third-party-${{ env.CACHE_KEY }}
+          restore-keys: ${{ runner.OS }}-third-party-
+
+      - name: Libraries cache.
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+            !${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\*
+            !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ${{ runner.OS }}-x64-libs-release-${{ env.CACHE_KEY }}
+          restore-keys: ${{ runner.OS }}-x64-libs-release-
+
+      - name: Qt cache.
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ${{ runner.OS }}-x64-qt-release-${{ env.CACHE_KEY }}
+          restore-keys: ${{ runner.OS }}-x64-qt-release-
+
+      - name: Libraries.
+        run: |
+          %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat silent
+
+      - name: Free up some disk space.
+        shell: bash
+        run: find $LibrariesPath '(' '(' ! '(' -name '*.lib' -o -name '*.a' -o -name '*.exe' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cmake' -o -name '*.pc' -o -path '*/include/*' -o -path '*/objects-*' -o -path '*/cache_keys/*' -o -path '*/patches/*' -o -path '*/nv-codec-headers/*' ')' -type f ')' -o -empty ')' -delete
+
+      - name: TransGram build.
+        if: env.LIBRARIES_ONLY == 'false'
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        run: |
+          cd %TBUILD%\%REPO_NAME%\Telegram
+
+          call configure.bat x64 ^
+          -D TDESKTOP_API_ID=%TG_API_ID% ^
+          -D TDESKTOP_API_HASH=%TG_API_HASH% ^
+          -D CMAKE_CONFIGURATION_TYPES=Release ^
+          -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON ^
+          -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
+
+          cmake --build ..\out --config Release --target Telegram --parallel
+
+      - name: Package.
+        if: env.LIBRARIES_ONLY == 'false'
+        shell: pwsh
+        run: |
+          $version = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF_NAME.Substring(1) } else { "build-$env:GITHUB_RUN_NUMBER" }
+          $out = Join-Path $env:TBUILD "$env:REPO_NAME\out\Release"
+          $zip = "TransGram-$version-win64.zip"
+          Compress-Archive -Path "$out\TransGram.exe", "$out\modules" -DestinationPath $zip
+          "ZIP_NAME=$zip" >> $env:GITHUB_ENV
+
+      - name: Upload artifact.
+        if: env.LIBRARIES_ONLY == 'false'
+        uses: actions/upload-artifact@v7
+        with:
+          name: TransGram-win64
+          path: ${{ env.ZIP_NAME }}
+          retention-days: 7
+
+      - name: Publish release.
+        if: env.LIBRARIES_ONLY == 'false' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$ZIP_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "TransGram Desktop ${GITHUB_REF_NAME#v}" \
+            --notes "Unofficial Telegram client based on Telegram Desktop. Unzip and run TransGram.exe; keep the modules folder next to it."
