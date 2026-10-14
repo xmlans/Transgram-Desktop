@@ -23,7 +23,7 @@ on:
         default: false
   push:
     tags:
-      - 'v*'
+      - 'v[0-9]*'
 
 permissions:
   contents: write
